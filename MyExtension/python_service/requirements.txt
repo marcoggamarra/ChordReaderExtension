@@ -1,5 +1,5 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-numpy==2.1.1
+numpy==1.26.4
 cython
 madmom==0.16.1

@@ -5,14 +5,22 @@ let isRunning = false;
 let activeTabId = null;
 let lastResult = null;
 
-async function ensureOffscreenDocument() {
-  const contexts = await chrome.runtime.getContexts({
-    contextTypes: ["OFFSCREEN_DOCUMENT"],
-    documentUrls: [chrome.runtime.getURL(OFFSCREEN_DOCUMENT)]
-  });
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  if (contexts.length > 0) {
-    return;
+async function ensureOffscreenDocument() {
+  const getContexts = chrome.runtime.getContexts?.bind(chrome.runtime);
+
+  if (getContexts) {
+    const contexts = await getContexts({
+      contextTypes: ["OFFSCREEN_DOCUMENT"],
+      documentUrls: [chrome.runtime.getURL(OFFSCREEN_DOCUMENT)]
+    });
+
+    if (contexts.length > 0) {
+      return;
+    }
   }
 
   await chrome.offscreen.createDocument({
@@ -22,7 +30,27 @@ async function ensureOffscreenDocument() {
   });
 }
 
+async function sendMessageToOffscreen(message) {
+  let lastError = null;
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      const response = await chrome.runtime.sendMessage(message);
+      return response;
+    } catch (error) {
+      lastError = error;
+      await sleep(120);
+    }
+  }
+
+  throw lastError || new Error("Could not reach offscreen document.");
+}
+
 async function startAnalysis(tabId) {
+  if (!tabId) {
+    throw new Error("Missing tab id for capture.");
+  }
+
   await ensureOffscreenDocument();
 
   const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
@@ -30,18 +58,22 @@ async function startAnalysis(tabId) {
   isRunning = true;
   activeTabId = tabId;
 
-  await chrome.runtime.sendMessage({
+  const response = await sendMessageToOffscreen({
     type: "offscreen-start-capture",
     streamId,
     tabId
   });
+
+  if (!response?.ok) {
+    throw new Error(response?.error || "Offscreen capture failed to start.");
+  }
 }
 
 async function stopAnalysis() {
   isRunning = false;
   activeTabId = null;
 
-  await chrome.runtime.sendMessage({
+  await sendMessageToOffscreen({
     type: "offscreen-stop-capture"
   });
 }
@@ -98,7 +130,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       .then(() => sendResponse({ ok: true }))
       .catch((error) => {
         isRunning = false;
-        sendResponse({ ok: false, error: error.message });
+        sendResponse({ ok: false, error: error?.message || String(error) });
       });
     return true;
   }

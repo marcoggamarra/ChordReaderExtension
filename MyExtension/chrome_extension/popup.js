@@ -91,6 +91,11 @@ function loadVideoTitle(tabId) {
 
 function requestState() {
   chrome.runtime.sendMessage({ type: "get-state" }, (response) => {
+    if (chrome.runtime.lastError) {
+      setStatus(`runtime error: ${chrome.runtime.lastError.message}`);
+      return;
+    }
+
     if (!response) {
       setStatus("background unavailable");
       return;
@@ -113,6 +118,11 @@ startButton.addEventListener("click", () => {
 
   setStatus("starting");
   chrome.runtime.sendMessage({ type: "start-analysis", tabId: activeTabId }, (response) => {
+    if (chrome.runtime.lastError) {
+      setStatus(`start failed: ${chrome.runtime.lastError.message}`);
+      return;
+    }
+
     if (!response || !response.ok) {
       setStatus(response?.error || "could not start");
       return;
@@ -125,6 +135,11 @@ startButton.addEventListener("click", () => {
 
 stopButton.addEventListener("click", () => {
   chrome.runtime.sendMessage({ type: "stop-analysis" }, () => {
+    if (chrome.runtime.lastError) {
+      setStatus(`stop failed: ${chrome.runtime.lastError.message}`);
+      return;
+    }
+
     setStatus("idle");
     setButtons(false);
   });

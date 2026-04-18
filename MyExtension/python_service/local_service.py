@@ -1,14 +1,30 @@
 from typing import List
+import collections
+import collections.abc
 
 import numpy as np
 from fastapi import FastAPI
 from pydantic import BaseModel
 from starlette.middleware.cors import CORSMiddleware
 
+if not hasattr(np, "float"):
+    np.float = float  # type: ignore[attr-defined]
+if not hasattr(np, "int"):
+    np.int = int  # type: ignore[attr-defined]
+if not hasattr(np, "complex"):
+    np.complex = complex  # type: ignore[attr-defined]
+
+MADMOM_IMPORT_ERROR = None
+
+for name in ("Mapping", "MutableMapping", "Sequence", "MutableSequence"):
+    if not hasattr(collections, name):
+        setattr(collections, name, getattr(collections.abc, name))
+
 try:
     import madmom
-except Exception:  # pragma: no cover
+except Exception as error:  # pragma: no cover
     madmom = None
+    MADMOM_IMPORT_ERROR = str(error)
 
 
 class AnalyzeRequest(BaseModel):
@@ -26,6 +42,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/")
+def root() -> dict:
+    return {
+        "service": "Local Music Analyzer",
+        "status": "running",
+        "endpoints": {
+            "health": "/health",
+            "analyze": "/analyze",
+            "docs": "/docs",
+        },
+    }
 
 
 def estimate_bpm(samples: np.ndarray, sample_rate: int) -> tuple[float, float]:
@@ -130,7 +159,11 @@ def estimate_chord(samples: np.ndarray, sample_rate: int) -> tuple[str, float]:
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True, "madmom": madmom is not None}
+    return {
+        "ok": True,
+        "madmom": madmom is not None,
+        "madmomError": MADMOM_IMPORT_ERROR,
+    }
 
 
 @app.post("/analyze")
