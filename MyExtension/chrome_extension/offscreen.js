@@ -119,6 +119,10 @@ async function startCapture(streamId) {
   muteGainNode = audioContext.createGain();
   muteGainNode.gain.value = 0;
 
+  // Pass-through: keep tab audio audible while capturing
+  sourceNode.connect(audioContext.destination);
+
+  // Analysis chain (muted output so ScriptProcessor fires without doubling audio)
   sourceNode.connect(analyserNode);
   analyserNode.connect(processorNode);
   processorNode.connect(muteGainNode);
@@ -136,7 +140,7 @@ async function startCapture(streamId) {
     }
 
     const now = Date.now();
-    if (now - lastSent < 300) {
+    if (now - lastSent < 200) {
       return;
     }
 
@@ -147,7 +151,7 @@ async function startCapture(streamId) {
     chrome.runtime.sendMessage({
       type: "offscreen-audio-chunk",
       sampleRate: audioContext.sampleRate,
-      samples: downsample(current, TARGET_SAMPLES),
+      samples: Array.from(current),
       energy: computeEnergy(current),
       spectrum: spectrumBars(analyserNode),
       timestampMs: now

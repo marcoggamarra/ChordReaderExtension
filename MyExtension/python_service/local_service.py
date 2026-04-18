@@ -46,13 +46,35 @@ app.add_middleware(
 
 # ---------------------------------------------------------------------------
 # Server-side state for BPM estimation
-# Each audio chunk is ~0.5 s — too short on its own.  We accumulate onset
-# strength vectors across up to 20 chunks (~6 s) before running autocorrelation,
-# and keep a short history of confirmed BPM values to further smooth output.
+# We accumulate raw audio samples in a sliding window (~10 s) so that both
+# madmom and the fallback autocorrelation have enough context for reliable
+# tempo estimation.  BPM is re-computed at most every 2 seconds to save CPU;
+# intermediate /analyze calls return the cached value.
 # ---------------------------------------------------------------------------
 _state_lock = threading.Lock()
 _onset_accumulator: collections.deque = collections.deque(maxlen=20)
 _bpm_history: collections.deque = collections.deque(maxlen=10)
+
+# Raw sample sliding window — keeps the last ~10 s of audio
+_SAMPLE_WINDOW_SECONDS = 10
+_sample_buffer: list[float] = []
+_sample_rate_hint: int = 48000  # updated on first chunk
+
+# BPM computation throttle
+_last_bpm_time: float = 0.0
+_BPM_RECOMPUTE_INTERVAL: float = 2.0  # seconds
+_cached_bpm: float = 0.0
+_cached_bpm_confidence: float = 0.0
+
+# Chord stabilisation state
+_chroma_ema: np.ndarray | None = None       # exponential moving avg of chroma
+_CHROMA_EMA_ALPHA: float = 0.6              # blend factor for new chroma (higher = more responsive)
+_current_chord: str = "N"
+_current_chord_confidence: float = 0.0
+_candidate_chord: str = "N"                 # chord that is trying to replace the current one
+_candidate_count: int = 0                   # consecutive frames the candidate has won
+_CHORD_CONFIRM_FRAMES: int = 1             # just 1 frame confirmation (~200ms)
+_CHORD_HYSTERESIS: float = 0.008           # very small margin to prevent micro-flicker
 
 
 @app.get("/")
@@ -72,9 +94,23 @@ def root() -> dict:
 @app.post("/reset")
 def reset_state() -> dict:
     """Clear accumulated BPM state. Call when a new song starts."""
+    global _sample_buffer, _sample_rate_hint
+    global _last_bpm_time, _cached_bpm, _cached_bpm_confidence
+    global _chroma_ema, _current_chord, _current_chord_confidence
+    global _candidate_chord, _candidate_count
     with _state_lock:
         _onset_accumulator.clear()
         _bpm_history.clear()
+        _sample_buffer = []
+        _sample_rate_hint = 48000
+        _last_bpm_time = 0.0
+        _cached_bpm = 0.0
+        _cached_bpm_confidence = 0.0
+        _chroma_ema = None
+        _current_chord = "N"
+        _current_chord_confidence = 0.0
+        _candidate_chord = "N"
+        _candidate_count = 0
     return {"ok": True}
 
 
@@ -140,20 +176,65 @@ def _smooth_bpm(history: collections.deque) -> float:
 
 
 # ---------------------------------------------------------------------------
-# BPM estimation
+# BPM estimation — uses the sliding-window sample buffer
 # ---------------------------------------------------------------------------
 
+def _accumulate_samples(samples: np.ndarray, sample_rate: int) -> np.ndarray:
+    """Append *samples* to the global sliding window and return the full buffer."""
+    global _sample_buffer, _sample_rate_hint
+    _sample_rate_hint = sample_rate
+    max_samples = int(_SAMPLE_WINDOW_SECONDS * sample_rate)
+
+    _sample_buffer.extend(samples.tolist())
+    if len(_sample_buffer) > max_samples:
+        _sample_buffer = _sample_buffer[-max_samples:]
+
+    return np.array(_sample_buffer, dtype=np.float32)
+
+
 def estimate_bpm(samples: np.ndarray, sample_rate: int) -> tuple[float, float]:
-    # --- madmom path (best quality) ---
+    import time as _time
+
+    global _last_bpm_time, _cached_bpm, _cached_bpm_confidence
+
+    with _state_lock:
+        full_buffer = _accumulate_samples(samples, sample_rate)
+        buffer_duration = len(full_buffer) / sample_rate
+
+        # Return cached BPM while we're still accumulating (<5 s)
+        # or if we re-computed recently (<2 s)
+        now = _time.monotonic()
+        need_recompute = (
+            now - _last_bpm_time >= _BPM_RECOMPUTE_INTERVAL
+            or _cached_bpm <= 0.0
+        )
+
+        if buffer_duration < 5.0:
+            if _cached_bpm > 0.0:
+                return _cached_bpm, _cached_bpm_confidence
+            return 0.0, 0.0
+
+        if not need_recompute:
+            return _cached_bpm, _cached_bpm_confidence
+
+    # --- madmom path (best quality) — run on full accumulated buffer ---
     if madmom is not None:
         try:
-            signal = madmom.audio.signal.Signal(samples, sample_rate=sample_rate, num_channels=1)
+            signal = madmom.audio.signal.Signal(
+                full_buffer, sample_rate=sample_rate, num_channels=1
+            )
             activations = madmom.features.beats.RNNBeatProcessor()(signal)
-            tempo_candidates = madmom.features.tempo.TempoEstimationProcessor(fps=100)(activations)
+            tempo_candidates = madmom.features.tempo.TempoEstimationProcessor(
+                fps=100
+            )(activations)
 
             if len(tempo_candidates) > 0:
                 top = tempo_candidates[0]
-                bpm = float(top[0]) if isinstance(top, (list, tuple, np.ndarray)) else float(top)
+                bpm = (
+                    float(top[0])
+                    if isinstance(top, (list, tuple, np.ndarray))
+                    else float(top)
+                )
                 confidence = (
                     float(top[1])
                     if isinstance(top, (list, tuple, np.ndarray)) and len(top) > 1
@@ -162,43 +243,38 @@ def estimate_bpm(samples: np.ndarray, sample_rate: int) -> tuple[float, float]:
                 with _state_lock:
                     _bpm_history.append(bpm)
                     smoothed = _smooth_bpm(_bpm_history)
-                return smoothed, float(np.clip(confidence, 0.0, 1.0))
+                    _cached_bpm = smoothed
+                    _cached_bpm_confidence = float(np.clip(confidence, 0.0, 1.0))
+                    _last_bpm_time = _time.monotonic()
+                return _cached_bpm, _cached_bpm_confidence
         except Exception:
             pass
 
-    # --- fallback: spectral-flux onset autocorrelation ---
-    if samples.size < 1024:
+    # --- fallback: spectral-flux onset autocorrelation on full buffer ---
+    if full_buffer.size < 1024:
         return 0.0, 0.0
 
-    # hop ~10 ms at 44100 Hz — fine enough for beat-level autocorrelation
     hop = max(1, sample_rate // 100)
-    onset = _compute_onset_strength(samples, hop=hop)
+    onset = _compute_onset_strength(full_buffer, hop=hop)
 
-    with _state_lock:
-        _onset_accumulator.append(onset)
+    if onset.size < 2:
+        return 0.0, 0.0
 
-        # Wait for at least ~1.5 s of accumulated data before first estimate
-        if len(_onset_accumulator) < 5:
-            if _bpm_history:
-                return float(_bpm_history[-1]), 0.3
-            return 0.0, 0.0
-
-        accumulated = np.concatenate(list(_onset_accumulator))
-
-    accumulated -= np.mean(accumulated)
-    std = np.std(accumulated)
+    onset -= np.mean(onset)
+    std = np.std(onset)
     if std < 1e-9:
         return 0.0, 0.0
-    accumulated /= std
+    onset /= std
 
     fps = sample_rate / hop
-    min_lag = max(1, int(fps * 60.0 / 200.0))
-    max_lag = min(len(accumulated) - 1, int(fps * 60.0 / 60.0))
+    # Search 40–220 BPM (covers slow ballads through fast punk)
+    min_lag = max(1, int(fps * 60.0 / 220.0))
+    max_lag = min(len(onset) - 1, int(fps * 60.0 / 40.0))
 
     if max_lag <= min_lag:
         return 0.0, 0.0
 
-    corr = np.correlate(accumulated, accumulated, mode="full")
+    corr = np.correlate(onset, onset, mode="full")
     corr = corr[corr.size // 2 :]
 
     search = corr[min_lag : max_lag + 1]
@@ -210,7 +286,7 @@ def estimate_bpm(samples: np.ndarray, sample_rate: int) -> tuple[float, float]:
     # Prefer half-time or double-time if they score noticeably higher
     for mult in (0.5, 2.0):
         alt_bpm = bpm * mult
-        if 60.0 <= alt_bpm <= 200.0:
+        if 40.0 <= alt_bpm <= 220.0:
             alt_lag = int(fps * 60.0 / alt_bpm)
             if min_lag <= alt_lag <= max_lag and alt_lag < len(corr):
                 alt_score = float(corr[alt_lag] / (corr[0] + 1e-9))
@@ -221,30 +297,38 @@ def estimate_bpm(samples: np.ndarray, sample_rate: int) -> tuple[float, float]:
     with _state_lock:
         _bpm_history.append(bpm)
         smoothed = _smooth_bpm(_bpm_history)
+        _cached_bpm = smoothed
+        _cached_bpm_confidence = float(np.clip(confidence, 0.0, 1.0))
+        _last_bpm_time = _time.monotonic()
 
-    return smoothed, float(np.clip(confidence, 0.0, 1.0))
+    return _cached_bpm, _cached_bpm_confidence
 
 
 # ---------------------------------------------------------------------------
-# Chord estimation
+# Chord estimation — with chroma smoothing, hysteresis and confirmation
 # ---------------------------------------------------------------------------
 
-def estimate_chord(samples: np.ndarray, sample_rate: int) -> tuple[str, float]:
+_NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+_MAJOR_TEMPLATE = np.zeros(12)
+_MAJOR_TEMPLATE[[0, 4, 7]] = [1.0, 0.8, 0.9]
+_MINOR_TEMPLATE = np.zeros(12)
+_MINOR_TEMPLATE[[0, 3, 7]] = [1.0, 0.8, 0.9]
+
+
+def _raw_chroma(samples: np.ndarray, sample_rate: int) -> np.ndarray | None:
+    """Compute an L1-normalised 12-bin chroma vector from *samples*."""
     if samples.size < 2048:
-        return "N", 0.0
+        return None
 
     window = np.hanning(samples.size)
     spectrum = np.fft.rfft(samples * window)
-    # Log magnitude compresses the dynamic range so soft harmonics aren't
-    # drowned out by the loudest partial — yields cleaner chroma vectors.
     log_mag = np.log1p(np.abs(spectrum))
     freqs = np.fft.rfftfreq(samples.size, d=1.0 / sample_rate)
 
     chroma = np.zeros(12, dtype=np.float64)
-
     for i in range(1, len(freqs)):
         freq = freqs[i]
-        # 65 Hz ≈ C2, 2000 Hz covers fundamentals + first few harmonics up to ~C7
         if freq < 65.0 or freq > 2000.0:
             continue
         midi = 69.0 + 12.0 * np.log2(freq / 440.0)
@@ -253,39 +337,96 @@ def estimate_chord(samples: np.ndarray, sample_rate: int) -> tuple[str, float]:
 
     chroma_sum = np.sum(chroma)
     if chroma_sum < 1e-9:
-        return "N", 0.0
-
-    # L1-normalize so template matching is independent of absolute loudness
+        return None
     chroma /= chroma_sum
+    return chroma
 
-    note_names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
-    # Slightly weight the fifth (index 7) more than the third — the fifth is
-    # more acoustically stable and less ambiguous between major and minor.
-    major_template = np.zeros(12)
-    major_template[[0, 4, 7]] = [1.0, 0.8, 0.9]
-    minor_template = np.zeros(12)
-    minor_template[[0, 3, 7]] = [1.0, 0.8, 0.9]
-
+def _best_chord(chroma: np.ndarray) -> tuple[str, float, float]:
+    """Template-match a chroma vector against major/minor triads.
+    Returns (name, raw_score, confidence_0_to_1)."""
     best_name = "N"
     best_score = -1.0
 
     for root in range(12):
-        maj = float(np.dot(chroma, np.roll(major_template, root)))
-        min_ = float(np.dot(chroma, np.roll(minor_template, root)))
+        maj = float(np.dot(chroma, np.roll(_MAJOR_TEMPLATE, root)))
+        min_ = float(np.dot(chroma, np.roll(_MINOR_TEMPLATE, root)))
 
         if maj > best_score:
             best_score = maj
-            best_name = note_names[root]
+            best_name = _NOTE_NAMES[root]
 
         if min_ > best_score:
             best_score = min_
-            best_name = f"{note_names[root]}m"
+            best_name = f"{_NOTE_NAMES[root]}m"
 
-    # A perfect 3-note chord in isolation scores ~(1+0.8+0.9)/(3*12) ≈ 0.075
-    # after L1 normalization over 12 pitch classes.  Scale so that score gives ~1.0.
     confidence = float(np.clip(best_score / 0.075, 0.0, 1.0))
-    return best_name, confidence
+    return best_name, best_score, confidence
+
+
+def _chord_score(chord_name: str, chroma: np.ndarray) -> float:
+    """Return the raw template dot-product score for a specific chord."""
+    for root in range(12):
+        name = _NOTE_NAMES[root]
+        if chord_name == name:
+            return float(np.dot(chroma, np.roll(_MAJOR_TEMPLATE, root)))
+        if chord_name == f"{name}m":
+            return float(np.dot(chroma, np.roll(_MINOR_TEMPLATE, root)))
+    return 0.0
+
+
+def estimate_chord(samples: np.ndarray, sample_rate: int) -> tuple[str, float]:
+    global _chroma_ema, _current_chord, _current_chord_confidence
+    global _candidate_chord, _candidate_count
+
+    raw = _raw_chroma(samples, sample_rate)
+    if raw is None:
+        return _current_chord, _current_chord_confidence
+
+    # --- Exponential moving average on chroma ---
+    with _state_lock:
+        if _chroma_ema is None:
+            _chroma_ema = raw.copy()
+        else:
+            _chroma_ema = _CHROMA_EMA_ALPHA * raw + (1.0 - _CHROMA_EMA_ALPHA) * _chroma_ema
+
+        smoothed_chroma = _chroma_ema.copy()
+
+    new_chord, new_score, new_confidence = _best_chord(smoothed_chroma)
+
+    # --- Hysteresis + confirmation window ---
+    with _state_lock:
+        if new_chord == _current_chord:
+            # Same chord — just refresh confidence, reset candidate
+            _current_chord_confidence = new_confidence
+            _candidate_chord = "N"
+            _candidate_count = 0
+            return _current_chord, _current_chord_confidence
+
+        # Different chord — check if it beats the current one by the
+        # hysteresis margin (so transient melody notes don't cause flicker)
+        current_score = _chord_score(_current_chord, smoothed_chroma)
+
+        if new_score < current_score + _CHORD_HYSTERESIS:
+            # New chord doesn't win by enough — keep current
+            _candidate_chord = "N"
+            _candidate_count = 0
+            return _current_chord, _current_chord_confidence
+
+        # New chord wins by the margin — start/continue confirmation
+        if new_chord == _candidate_chord:
+            _candidate_count += 1
+        else:
+            _candidate_chord = new_chord
+            _candidate_count = 1
+
+        if _candidate_count >= _CHORD_CONFIRM_FRAMES:
+            _current_chord = new_chord
+            _current_chord_confidence = new_confidence
+            _candidate_chord = "N"
+            _candidate_count = 0
+
+        return _current_chord, _current_chord_confidence
 
 
 # ---------------------------------------------------------------------------
