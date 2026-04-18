@@ -1,4 +1,4 @@
-# YouTube Music Analyzer
+# Chord Music Analyzer
 
 Chrome extension + local Python service for real-time music analysis (BPM, chord, confidence, and visualization).
 

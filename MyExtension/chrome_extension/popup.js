@@ -1,5 +1,7 @@
 const titleElement = document.getElementById("title");
-const statusElement = document.getElementById("status");
+const statusElement = document.getElementById("statusText");
+const statusDot = document.getElementById("statusDot");
+const bgHint = document.getElementById("bgHint");
 const bpmElement = document.getElementById("bpm");
 const chordElement = document.getElementById("chord");
 const confidenceElement = document.getElementById("confidence");
@@ -13,6 +15,10 @@ let activeTabId = null;
 
 function setStatus(text) {
   statusElement.textContent = `Status: ${text}`;
+  const isRunningState = text === "running";
+  const isError = text.includes("error") || text.includes("failed") || text.includes("unavailable");
+  statusDot.className = isRunningState ? "running" : isError ? "error" : "";
+  bgHint.className = isRunningState ? "visible" : "";
 }
 
 function setButtons(isRunning) {
@@ -41,7 +47,7 @@ function drawBars(bars) {
 }
 
 function updateMetrics(data) {
-  bpmElement.textContent = data.bpm ? `${data.bpm.toFixed(1)} BPM` : "-";
+  bpmElement.textContent = data.bpm ? `${Math.round(data.bpm)} BPM` : "-";
   chordElement.textContent = data.chord || "-";
   confidenceElement.textContent = data.confidence != null ? `${Math.round(data.confidence * 100)}%` : "-";
   energyElement.textContent = data.energy != null ? data.energy.toFixed(3) : "-";
@@ -157,6 +163,11 @@ chrome.runtime.onMessage.addListener((message) => {
     setButtons(false);
   }
 });
+
+// Poll for state every second so the popup stays in sync even after being
+// reopened or if a push message was missed while the popup was closed.
+const pollInterval = setInterval(requestState, 1000);
+window.addEventListener("unload", () => clearInterval(pollInterval));
 
 getActiveYouTubeTab((result) => {
   if (result.error) {

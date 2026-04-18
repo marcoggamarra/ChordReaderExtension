@@ -71,12 +71,54 @@
 				opacity: 0.6;
 				cursor: not-allowed;
 			}
+
+			#status {
+				display: flex;
+				align-items: center;
+				gap: 6px;
+			}
+
+			#statusDot {
+				width: 8px;
+				height: 8px;
+				border-radius: 50%;
+				background: #aaa;
+				flex-shrink: 0;
+				transition: background 0.3s;
+			}
+
+			#statusDot.running {
+				background: #22c55e;
+				box-shadow: 0 0 4px #22c55e;
+				animation: pulse 1.4s ease-in-out infinite;
+			}
+
+			#statusDot.error {
+				background: #ef4444;
+			}
+
+			@keyframes pulse {
+				0%, 100% { opacity: 1; }
+				50% { opacity: 0.4; }
+			}
+
+			#bgHint {
+				font-size: 11px;
+				color: #888;
+				margin-top: 6px;
+				display: none;
+			}
+
+			#bgHint.visible {
+				display: block;
+			}
 		</style>
 	</head>
 	<body>
 		<h1>YouTube Music Analyzer</h1>
 		<div id="title">Loading video title...</div>
-		<div id="status">Status: idle</div>
+		<div id="status"><span id="statusDot"></span><span id="statusText">Status: idle</span></div>
+		<div id="bgHint">Analysis continues in background — reopen to view results.</div>
 		<div class="row"><span class="label">Tempo:</span><span id="bpm">-</span></div>
 		<div class="row"><span class="label">Chord:</span><span id="chord">-</span></div>
 		<div class="row"><span class="label">Confidence:</span><span id="confidence">-</span></div>
